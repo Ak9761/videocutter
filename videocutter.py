@@ -6,102 +6,139 @@ from yt_dlp import YoutubeDL
 
 st.set_page_config(page_title="YouTube Video Cutter", layout="centered")
 
-st.title("🎬 YouTube Video Cutter (Stream & Cut)")
-st.write("Cuts directly from YouTube stream. No full video download.")
+st.title("🎬 YouTube Video Cutter")
+st.write("Paste a YouTube link with timestamp and create a clip or Short.")
 
-# -------- INPUTS --------
+# ---------------- INPUTS ----------------
 yt_url = st.text_input(
-    "YouTube Video URL",
-    value="https://youtu.be/giT0ytynSqg"
+    "YouTube Video URL (can include timestamp)",
+    value="https://youtu.be/giT0ytynSqg?t=1h27m50s"
 )
 
-start_time = st.text_input("Start Time (HH:MM:SS)", "01:27:50")
-end_time = st.text_input("End Time (HH:MM:SS)", "01:28:10")
+duration = st.number_input(
+    "Clip duration (seconds)",
+    min_value=1,
+    max_value=60,
+    value=20
+)
+
+make_short = st.checkbox("📱 Convert to YouTube Shorts (9:16)", value=True)
+
+# ---------------- HELPERS ----------------
+import re
+from urllib.parse import urlparse, parse_qs
+
+def parse_timestamp(url):
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+
+    if "t" in qs:
+        return parse_time_string(qs["t"][0])
+    if "start" in qs:
+        return int(qs["start"][0])
+
+    return 0  # default start
 
 
-# -------- CORE FUNCTION --------
-def cut_video_stream(url, start, end, output_file):
-    # 1️⃣ Extract streaming URLs (NO DOWNLOAD)
+def parse_time_string(t):
+    if t.isdigit():
+        return int(t)
+
+    h = m = s = 0
+    match = re.match(r'(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?', t)
+    if match:
+        h, m, s = match.groups(default="0")
+        return int(h) * 3600 + int(m) * 60 + int(s)
+
+    return 0
+
+
+def seconds_to_hms(seconds):
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02}:{m:02}:{s:02}"
+
+
+# ---------------- CORE LOGIC ----------------
+def process_video(url, start_time, end_time, output_file, shorts):
+    temp_id = uuid.uuid4().hex
+    temp_video = f"temp_{temp_id}.mp4"
+
+    # 1️⃣ Download merged video + audio (TEMP)
     ydl_opts = {
+        "format": "bv*[height<=720]+ba/b",
+        "merge_output_format": "mp4",
+        "outtmpl": temp_video,
         "quiet": True,
-        "skip_download": True,
+        "noplaylist": True
     }
 
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        formats = info.get("formats", [])
+        ydl.download([url])
 
-        best = None
-        for f in formats:
-            if f.get("vcodec") != "none" and f.get("acodec") != "none":
-                best = f
+    # 2️⃣ Video filter
+    if shorts:
+        video_filter = "crop=ih*9/16:ih,scale=1080:1920"
+    else:
+        video_filter = "scale=1280:720"
 
-        if not best:
-            raise RuntimeError("No combined audio+video stream found")
-
-        stream_url = best["url"]
-
-    # 2️⃣ Fast cut (keyframe-based)
-    cmd = cmd = [
-    "ffmpeg",
-    "-y",
-    "-ss", start,
-    "-to", end,
-    "-i", stream_url,
-
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
-    "-pix_fmt", "yuv420p",
-    "-profile:v", "main",
-    "-level", "4.0",
-    "-movflags", "+faststart",
-
-    "-c:a", "aac",
-    "-b:a", "128k",
-
-    output_file
-]
+    # 3️⃣ Cut + encode
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss", start_time,
+        "-to", end_time,
+        "-i", temp_video,
+        "-vf", video_filter,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-c:a", "aac",
+        "-b:a", "160k",
+        output_file
+    ]
 
     subprocess.run(cmd, check=True)
 
+    # 4️⃣ Cleanup
+    os.remove(temp_video)
 
-# -------- UI ACTION --------
-if yt_url and st.button("✂️ Cut Video"):
-    output_file = f"clip_{uuid.uuid4()}.mp4"
+
+# ---------------- RUN ----------------
+if yt_url and st.button("✂️ Create Clip"):
+    start_seconds = parse_timestamp(yt_url)
+    start_time = seconds_to_hms(start_seconds)
+    end_time = seconds_to_hms(start_seconds + duration)
+
+    output_file = f"clip_{uuid.uuid4().hex}.mp4"
 
     try:
-        with st.spinner("⏳ Streaming & cutting (no full download)…"):
-            cut_video_stream(yt_url, start_time, end_time, output_file)
+        with st.spinner("Processing video (may take 1–2 minutes)…"):
+            process_video(
+                yt_url,
+                start_time,
+                end_time,
+                output_file,
+                make_short
+            )
 
-        st.success("✅ Clip created successfully!")
+        st.success("✅ Video created successfully!")
 
-    except Exception:
-        st.warning("⚠️ Fast cut failed. Retrying with re-encode (slower but guaranteed)…")
-
-        # 🔁 Guaranteed fallback (re-encode)
-        fallback_cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss", start_time,
-            "-to", end_time,
-            "-i", yt_url,
-            "-c:v", "libx264",
-            "-c:a", "aac",
-            output_file
-        ]
-        subprocess.run(fallback_cmd, check=True)
-
-        st.success("✅ Clip created (re-encoded)")
-
-    # -------- DOWNLOAD --------
-    if os.path.exists(output_file):
         with open(output_file, "rb") as f:
             st.download_button(
-                "⬇️ Download Clip",
-                data=f.read(),
-                file_name="clip.mp4",
+                "⬇️ Download Video",
+                data=f,
+                file_name="short.mp4" if make_short else "clip.mp4",
                 mime="video/mp4"
             )
 
-        os.remove(output_file)
+    except Exception as e:
+        st.error("❌ Video processing failed")
+        st.exception(e)
+
+    finally:
+        if os.path.exists(output_file):
+            os.remove(output_file)
