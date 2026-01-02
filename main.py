@@ -1,62 +1,102 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import FileResponse
-import uuid, os, subprocess
 from yt_dlp import YoutubeDL
+import subprocess
+import uuid
+import os
+import shutil
 
-app = FastAPI()
+app = FastAPI(title="YouTube Video Cutter API")
 
+TEMP_DIR = "temp"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# ------------------------
+# Health Check
+# ------------------------
 @app.get("/")
-def root():
+def health():
     return {"status": "ok"}
 
-@app.post("/cut")
-def cut_video(
+
+# ------------------------
+# Core Video Processor
+# ------------------------
+def process_video(
     url: str,
     start: str,
     end: str,
-    shorts: bool = True
-):
-    job_id = uuid.uuid4().hex
-    temp_video = f"/tmp/input_{job_id}.mp4"
-    output_video = f"/tmp/output_{job_id}.mp4"
+    make_short: bool
+) -> str:
+    video_id = uuid.uuid4().hex
+    temp_video = f"{TEMP_DIR}/{video_id}.mp4"
+    output_video = f"{TEMP_DIR}/clip_{video_id}.mp4"
 
-    # 1️⃣ Download video
+    # 1️⃣ Download ONLY ONCE (best quality, correct audio)
     ydl_opts = {
         "format": "bv*[height<=720]+ba/b",
         "merge_output_format": "mp4",
         "outtmpl": temp_video,
         "quiet": True,
-        "noplaylist": True
     }
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
     except Exception:
-        raise HTTPException(400, "Failed to download video")
+        raise HTTPException(status_code=400, detail="Failed to download video")
 
-    # 2️⃣ Shorts or normal
-    vf = "crop=ih*9/16:ih,scale=1080:1920" if shorts else "scale=1280:720"
-
-    # 3️⃣ Cut & encode
+    # 2️⃣ FFmpeg cut command
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-ss", start,
         "-to", end,
         "-i", temp_video,
-        "-vf", vf,
         "-c:v", "libx264",
-        "-preset", "fast",
+        "-preset", "veryfast",
         "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
         "-c:a", "aac",
-        "-b:a", "160k",
-        output_video
+        "-b:a", "128k",
     ]
 
-    subprocess.run(cmd, check=True)
+    # 3️⃣ Shorts conversion (9:16)
+    if make_short:
+        cmd += [
+            "-vf",
+            "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+        ]
+
+    cmd.append(output_video)
+
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError:
+        raise HTTPException(status_code=500, detail="FFmpeg processing failed")
+    finally:
+        if os.path.exists(temp_video):
+            os.remove(temp_video)
+
+    return output_video
+
+
+# ------------------------
+# API Endpoint
+# ------------------------
+@app.get("/cut")
+def cut_video(
+    url: str = Query(..., description="YouTube URL"),
+    start: str = Query(..., description="Start time HH:MM:SS"),
+    end: str = Query(..., description="End time HH:MM:SS"),
+    short: bool = Query(False, description="Convert to YouTube Shorts (9:16)")
+):
+    output = process_video(url, start, end, short)
 
     return FileResponse(
-        output_video,
+        output,
         media_type="video/mp4",
-        filename="short.mp4"
+        filename="clip.mp4",
+        background=lambda: shutil.rmtree(TEMP_DIR, ignore_errors=True)
     )
